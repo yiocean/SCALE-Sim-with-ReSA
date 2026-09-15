@@ -117,6 +117,49 @@ def access_counts(dataflow, m, n, k, arr_row, arr_col, valid_ifmap=None):
     return valid_ifmap * col_folds, k * n * row_folds, m * n
 
 
+def partial_sum_reads(dataflow, m, n, k, arr_row, arr_col):
+    """Partial-sum read-backs one tile needs, on top of access_counts().
+
+        WS / IS   (row_folds - 1) * M * N
+        OS        0
+
+    SCALE-Sim models compute, not accumulation. When K exceeds the array height
+    the reduction is folded over time: WS and IS put K on the rows, so a tile is
+    swept row_folds times and each sweep produces a partial result over its own
+    K slice. The ofmap demand matrix already carries the WRITE of every one of
+    them -- that is why the ofmap access law is M * N * row_folds and not M * N.
+    What SCALE-Sim never emits is the matching READ: fold i+1 has to fetch fold
+    i's partial sum back to accumulate onto it. An accumulation is a
+    read-modify-write and only the write was being charged.
+
+    This is K folded in TIME, inside one thread, on one logical array, into that
+    thread's own buffer group. It is not the cross-sub-array K split that
+    CLAUDE.md rule 7 excludes -- no partial sum crosses a thread boundary and
+    tensor_split.split_operands still refuses to slice K. The two are
+    independent; this one has been in the model since Phase 0 by way of
+    fold_counts(), only half-priced.
+
+    OS is zero because it holds the output stationary and streams K through
+    time, accumulating in place in the PE: its folds are over M and N, which
+    need no reduction. That asymmetry is real and is why high-K layers should
+    prefer OS once this is charged.
+
+    Where the read-back lands is an estimate (docs/resa_spec.md section 8, item
+    16): the paper gives each sub-array an accumulator on the drain edge that
+    sends results back to the on-chip buffer (section 3.1), which fixes the PORT
+    -- the same bottom-edge ofmap port as the write -- but says nothing about
+    where a partial sum lives between two row folds. A per-sub-array accumulator
+    is one column wide and cannot hold M * N, so it is assumed to go back to the
+    buffer. Set [resa_buffer] PartialSumAccumulation = inline_accumulator to
+    price it at zero and measure how much the conclusion depends on this.
+    """
+    _check(dataflow, m, n, k, arr_row, arr_col)
+    if dataflow == 'os':
+        return 0
+    row_folds, _ = fold_counts(dataflow, m, n, k, arr_row, arr_col)
+    return (row_folds - 1) * m * n
+
+
 def valid_ifmap_rows(ifmap_op_mat):
     """Per-operand-row count of valid (non -1) ifmap entries.
 

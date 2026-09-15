@@ -14,6 +14,10 @@ sub-arrays buys serialisation, not multicast. What pays is two threads of one
 group running tiles that share an operand -- and that is the scheduler's
 choice, not the geometry's. See docs/resa_spec.md section 1.
 
+Reads and writes both count: a K-fold accumulation is a read-modify-write and
+SCALE-Sim emits only the write, so resa/partial_sum.py supplies the missing read
+stream and it is arbitrated on the same drain ports as the ofmap.
+
 Two modes:
 
   fast      a roofline: max(compute makespan, per-group words / budget).
@@ -105,6 +109,7 @@ def fast_layer_estimate(resa_cfg, fission_obj, dataflow, tile_shapes,
     budget = resa_cfg.get_group_port_budget()
     group_map = resa_cfg.get_group_map()
     arr_row, arr_col = fission_obj.logical_dims
+    charge_psum = resa_cfg.charges_partial_sum_reads()
 
     words = np.zeros(num_groups, dtype=np.float64)
     total_m = sum(m_len * count for m_len, _, count in tile_shapes)
@@ -121,6 +126,12 @@ def fast_layer_estimate(resa_cfg, fission_obj, dataflow, tile_shapes,
             ifmap, filt, ofmap = cycle_model.access_counts(
                 dataflow, m_len, n_len, window_size, arr_row, arr_col,
                 valid_ifmap=min(int(round(valid)), m_len * window_size))
+            # The read half of the K-fold accumulation, on the same drain ports
+            # as the write (resa/partial_sum.py). Zero for OS and whenever
+            # K <= arr_row, so this leaves single-fold layers untouched.
+            if charge_psum:
+                ofmap += cycle_model.partial_sum_reads(
+                    dataflow, m_len, n_len, window_size, arr_row, arr_col)
             words += per_thread * (
                 ifmap * share[0] / max(share[0].sum(), 1)
                 + filt * share[1] / max(share[1].sum(), 1)
@@ -163,13 +174,26 @@ def fast_layer_estimate(resa_cfg, fission_obj, dataflow, tile_shapes,
 def _wave_group_columns(resa_cfg, fission_obj, wave, demand_for):
     """Per group, the address columns every thread of the wave contributes.
 
-    Returns {group_id: [(matrix, column indices, sub-array ids)]} plus the wave
-    length. The sub-array ids are what the subarray_serial port model counts.
+    Returns (columns, psum_columns, wave_length), each mapping
+    {group_id: [(matrix, column indices, sub-array ids)]}. The sub-array ids are
+    what the subarray_serial port model counts.
+
+    The partial-sum read-back is kept in a SEPARATE de-duplication domain, and
+    that separation is load-bearing. It rides the very ports the ofmap write
+    does -- the paper puts an accumulator on each sub-array's drain edge that
+    returns results to the on-chip buffer (spec section 3.1) -- and it carries
+    the same addresses in the same cycles. Pooled with the writes, every read
+    would coalesce into the write of the value it is reading and the whole
+    stream would cost nothing. A read-modify-write is two port operations, not
+    one. Nothing is lost by separating them either: multicast pays off when two
+    THREADS want one address, and threads own disjoint output tiles, so no
+    legitimate ofmap or partial-sum coalescing exists to give up.
     """
     num_groups, _, _ = resa_cfg.get_buffer_group_layout()
     group_map = resa_cfg.get_group_map()
 
     columns = {group_id: [] for group_id in range(num_groups)}
+    psum_columns = {group_id: [] for group_id in range(num_groups)}
     wave_length = 0
     for job in wave:
         matrices = demand_for(job)
@@ -177,11 +201,16 @@ def _wave_group_columns(resa_cfg, fission_obj, wave, demand_for):
         ports = port_map.port_groups(fission_obj, group_map, job.thread_id,
                                      job.dataflow)
         owners = port_map.port_sub_arrays(fission_obj, job.thread_id, job.dataflow)
-        for matrix, port_group, port_owner in zip(matrices, ports, owners):
+        streams = list(zip(matrices[:3], ports, owners))
+        if len(matrices) == 4:
+            streams.append((matrices[3], ports[2], owners[2]))
+
+        for index, (matrix, port_group, port_owner) in enumerate(streams):
+            target = psum_columns if index == 3 else columns
             for group_id in np.unique(port_group):
                 selected = np.flatnonzero(port_group == group_id)
-                columns[group_id].append((matrix, selected, port_owner[selected]))
-    return columns, wave_length
+                target[group_id].append((matrix, selected, port_owner[selected]))
+    return columns, psum_columns, wave_length
 
 
 def _distinct_per_cycle(block):
@@ -216,6 +245,30 @@ def _active_sub_arrays(block, owners):
     return active
 
 
+def _assemble_block(pieces, start, stop, span):
+    """One group's address block for cycles [start, stop), or None if empty.
+
+    Returns (block, owner ids per column). Tiles shorter than the wave are
+    padded with nulls so every column of the block covers the same cycles.
+    """
+    blocks = []
+    owners = []
+    for matrix, selected, port_owner in pieces:
+        rows = matrix.shape[0]
+        if start >= rows:
+            continue
+        piece = matrix[start:min(stop, rows)][:, selected]
+        if piece.shape[0] < span:              # a shorter tile in this wave
+            piece = np.concatenate(
+                (piece, np.full((span - piece.shape[0], piece.shape[1]),
+                                -1, dtype=piece.dtype)))
+        blocks.append(piece)
+        owners.append(port_owner)
+    if not blocks:
+        return None
+    return np.concatenate(blocks, axis=1), np.concatenate(owners)
+
+
 def accurate_layer(resa_cfg, fission_obj, jobs, demand_for, switch_cycles=0):
     """Cycle-accurate contention over all waves of a layer.
 
@@ -236,8 +289,8 @@ def accurate_layer(resa_cfg, fission_obj, jobs, demand_for, switch_cycles=0):
     peak_load = 0
 
     for wave in waves(jobs, fission_obj.num_threads):
-        columns, wave_length = _wave_group_columns(resa_cfg, fission_obj, wave,
-                                                   demand_for)
+        columns, psum_columns, wave_length = _wave_group_columns(
+            resa_cfg, fission_obj, wave, demand_for)
         compute_cycles += wave_length
 
         for start in range(0, wave_length, CHUNK_CYCLES):
@@ -246,27 +299,24 @@ def accurate_layer(resa_cfg, fission_obj, jobs, demand_for, switch_cycles=0):
             service = np.ones(span, dtype=np.int64)
 
             for group_id, pieces in columns.items():
-                if not pieces:
-                    continue
-                blocks = []
-                owners = []
-                for matrix, selected, port_owner in pieces:
-                    rows = matrix.shape[0]
-                    if start >= rows:
-                        continue
-                    piece = matrix[start:min(stop, rows)][:, selected]
-                    if piece.shape[0] < span:      # a shorter tile in this wave
-                        piece = np.concatenate(
-                            (piece, np.full((span - piece.shape[0], piece.shape[1]),
-                                            -1, dtype=piece.dtype)))
-                    blocks.append(piece)
-                    owners.append(port_owner)
-                if not blocks:
+                # Two de-duplication domains, summed: the operand streams, where
+                # multicast is real, and the partial-sum read-back, which must
+                # not coalesce into the write it reads (_wave_group_columns).
+                domains = [_assemble_block(pieces, start, stop, span),
+                           _assemble_block(psum_columns[group_id],
+                                           start, stop, span)]
+                domains = [entry for entry in domains if entry is not None]
+                if not domains:
                     continue
 
-                block = np.concatenate(blocks, axis=1)
-                raw = np.count_nonzero(block != -1, axis=1).astype(np.int64)
-                distinct = _distinct_per_cycle(block)
+                raw = np.zeros(span, dtype=np.int64)
+                distinct = np.zeros(span, dtype=np.int64)
+                active = np.zeros(span, dtype=np.int64)
+                for block, owners in domains:
+                    raw += np.count_nonzero(block != -1, axis=1).astype(np.int64)
+                    distinct += _distinct_per_cycle(block)
+                    if port_model in ('subarray_serial', 'both'):
+                        active += _active_sub_arrays(block, owners)
 
                 multicast_savings += int((raw - distinct).sum())
                 group_words[group_id] += int(distinct.sum())
@@ -278,7 +328,6 @@ def accurate_layer(resa_cfg, fission_obj, jobs, demand_for, switch_cycles=0):
                                np.ceil(distinct / budget).astype(np.int64),
                                out=needed)
                 if port_model in ('subarray_serial', 'both'):
-                    active = _active_sub_arrays(block, np.concatenate(owners))
                     np.maximum(needed,
                                np.ceil(active / ports_per_group).astype(np.int64),
                                out=needed)

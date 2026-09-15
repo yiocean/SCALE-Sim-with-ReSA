@@ -157,7 +157,11 @@ class subarray_group:
     def get_fold_counts(self):
         """(row folds, col folds) SCALE-Sim used for the demand matrices."""
         assert self.compute_system is not None, 'run() first'
-        return (self.compute_system.row_fold_demand_matrices,
+        # WS exposes row_fold_demand_matrices (folds of the demand matrices)
+        # alongside row_fold (folds of the prefetch matrices); IS and OS define
+        # only row_fold. The two agree for every dense case this project runs.
+        return (getattr(self.compute_system, 'row_fold_demand_matrices',
+                        self.compute_system.row_fold),
                 self.compute_system.col_fold)
 
     def __repr__(self):

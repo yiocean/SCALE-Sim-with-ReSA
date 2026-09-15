@@ -37,6 +37,7 @@ class resa_config:
         self.buffer_kb_per_group = 1536
         self.onchip_bandwidth = 1024
         self.port_model = 'bandwidth'
+        self.partial_sum_accumulation = 'buffer'
         self.arbitration_policy = 'round_robin'
         self.multicast_scope = 'same_cycle_same_group_same_address'
         self.group_geometry = 'quadrant'
@@ -91,6 +92,8 @@ class resa_config:
         self.buffer_kb_per_group = parser.getint(section, 'BufferSizeKbPerGroup')
         self.onchip_bandwidth = parser.getint(section, 'OnChipBandwidthWordsPerCycle')
         self.port_model = parser.get(section, 'PortModel', fallback='bandwidth').strip()
+        self.partial_sum_accumulation = parser.get(
+            section, 'PartialSumAccumulation', fallback='buffer').strip()
         self.arbitration_policy = parser.get(section, 'ArbitrationPolicy').strip()
         self.multicast_scope = parser.get(section, 'MulticastScope').strip()
         self.group_geometry = parser.get(section, 'GroupGeometry').strip()
@@ -162,6 +165,8 @@ class resa_config:
 
         assert self.port_model in ('bandwidth', 'subarray_serial', 'both'), \
             'unknown PortModel: ' + self.port_model
+        assert self.partial_sum_accumulation in ('buffer', 'inline_accumulator'), \
+            'unknown PartialSumAccumulation: ' + self.partial_sum_accumulation
         assert self.onchip_bandwidth > 0
         assert self.onchip_bandwidth >= self.num_buffer_groups, \
             'on-chip bandwidth cannot give every group at least one word/cycle'
@@ -222,9 +227,42 @@ class resa_config:
         self.port_model = port_model
         return self.port_model
 
+    def get_partial_sum_accumulation(self):
+        """Where a partial sum lives between two K row folds.
+
+        'buffer'            read-modify-write through the ofmap port, the
+                            conservative default (docs/resa_spec.md section 8,
+                            item 16)
+        'inline_accumulator' free -- assumes hardware holds M*N partial sums
+                            outside the buffer. Not what the paper describes;
+                            kept so the sensitivity of the conclusion to this
+                            estimate can be measured.
+        """
+        return self.partial_sum_accumulation
+
+    def set_partial_sum_accumulation(self, mode):
+        """Swap the accumulation model in memory, for the sensitivity sweep."""
+        assert mode in ('buffer', 'inline_accumulator'), \
+            'unknown PartialSumAccumulation: %r' % (mode,)
+        self.partial_sum_accumulation = mode
+        return self.partial_sum_accumulation
+
+    def charges_partial_sum_reads(self):
+        """True when K-fold read-backs cost buffer-port bandwidth."""
+        return self.partial_sum_accumulation == 'buffer'
+
     def get_buffer_kb_per_group(self):
         """Total SCALE-Sim kB behind one buffer group, all operand types."""
         return self.buffer_kb_per_group
+
+    def get_operand_buffer_words_per_group(self):
+        """SCALE-Sim words one buffer group holds for ONE operand type.
+
+        BufferSizeKbPerGroup covers all three operand types, so this is a third
+        of it. A SCALE-Sim word is one byte of its own accounting and one 16-bit
+        ReSA element (configs/resa.cfg), so 512 kB here is 512 Ki elements.
+        """
+        return self.buffer_kb_per_group * 1024 // 3
 
     def get_arbitration_policy(self):
         return self.arbitration_policy

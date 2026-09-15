@@ -45,7 +45,12 @@ WORKLOADS = {
 # Cycle-accurate contention on UNet_maestro is too slow at a useful shortlist
 # depth. Under the mainline port model fast and accurate agree exactly, so the
 # fast path is used there and the report records which mode each layer used.
-ACCURATE_MODELS = ('MobileNet', 'GoogleNet', 'ResNet50')
+#
+# This is a DENYLIST on purpose. It used to be an allowlist of the three fast
+# workloads, which silently downgraded every topology passed with -t -- a model
+# the list had never heard of got the fast path without saying so. Anything not
+# named here runs cycle-accurate; --force-accurate overrides even this.
+SLOW_MODELS = ('UNet_maestro',)
 
 RANKING_CSV = 'RESA_SEARCH_RANKING_compute_only.csv'
 PROFILING_CSV = 'RESA_PROFILING_TABLE_compute_only.csv'
@@ -55,9 +60,18 @@ COMPUTE_CSV = 'RESA_COMPUTE_REPORT.csv'
 SUMMARY_CSV = 'RESA_SUMMARY.csv'
 
 
-def _load_topology(path):
+def _load_topology(path, input_type='conv'):
+    """Load a topology the way scalesim.scale does, conv or gemm.
+
+    GEMM files are M, N, K per row rather than a convolution description;
+    topology_utils lowers them to the same operand matrices either way, so
+    nothing downstream of here needs to know which it was.
+    """
     topo_obj = topologies()
-    topo_obj.load_arrays(topofile=path)
+    if input_type == 'gemm':
+        topo_obj.load_arrays_gemm(topofile=path)
+    else:
+        topo_obj.load_arrays(topofile=path)
     return topo_obj
 
 
@@ -115,7 +129,7 @@ def cmd_search(args):
     entries, rankings = [], {}
 
     for model, topology in _workloads(args).items():
-        topo_obj = _load_topology(topology)
+        topo_obj = _load_topology(topology, getattr(args, "input_type", "conv"))
         started = time.time()
         examined = [0]
 
@@ -154,12 +168,12 @@ def cmd_rerank(args):
     rows = []
 
     for model, topology in _workloads(args).items():
-        topo_obj = _load_topology(topology)
+        topo_obj = _load_topology(topology, getattr(args, "input_type", "conv"))
         started = time.time()
         picks = collections.Counter()
         boundary = 0
         accurate = (args.mode == 'accurate'
-                    and (model in ACCURATE_MODELS or args.force_accurate))
+                    and (model not in SLOW_MODELS or args.force_accurate))
 
         for layer_id in range(topo_obj.get_num_layers()):
             candidates = by_layer[(model, layer_id)]
@@ -247,7 +261,7 @@ def cmd_evaluate(args):
 
     all_rows, summaries = [], []
     for model, topology in _workloads(args).items():
-        topo_obj = _load_topology(topology)
+        topo_obj = _load_topology(topology, getattr(args, "input_type", "conv"))
         started = time.time()
         rows, picks = [], collections.Counter()
 
@@ -370,6 +384,9 @@ def build_parser():
     parser.add_argument('-t', '--topology', default=None,
                         help='any topology csv; without it the four workloads '
                              'in docs/resa_plan.md are used')
+    parser.add_argument('-i', '--input-type', choices=('conv', 'gemm'),
+                        default='conv', dest='input_type',
+                        help='topology format, mirroring scalesim.scale -i')
     parser.add_argument('-p', '--out', default='out/resa',
                         help='output directory (default: out/resa)')
     parser.add_argument('-m', '--models', nargs='*', default=None,

@@ -12,7 +12,7 @@ layer would need gigabytes (docs/resa_phase0_notes.md section 6.2).
 
 import numpy as np
 
-from resa import cycle_model, timeline_arbiter
+from resa import cycle_model, partial_sum, timeline_arbiter
 from resa.fission import fission_space
 from resa.scheduler import (balanced_makespan_bound, list_schedule,
                             wave_makespan, waves)
@@ -109,8 +109,15 @@ def _shapes_of(tiling):
 
 def _demand_builder(resa_cfg, operands, arr_row, arr_col, dataflow):
     """A demand_for(job) that builds a tile's matrices on demand and caches
-    only what the current wave needs."""
+    only what the current wave needs.
+
+    Returns three matrices, or four when the K-fold partial-sum read-back is
+    charged: (ifmap, filter, ofmap write, ofmap partial-sum read). The fourth
+    is absent for OS and whenever K fits the array height in one fold, so a
+    single-fold layer produces exactly what it always did.
+    """
     scale_cfg = resa_cfg.get_scale_config()
+    charge_psum = resa_cfg.charges_partial_sum_reads()
     cache = {}
 
     def demand_for(job):
@@ -119,7 +126,14 @@ def _demand_builder(resa_cfg, operands, arr_row, arr_col, dataflow):
             if len(cache) > 4 * 16:      # never hold more than a wave or two
                 cache.clear()
             group = subarray_group(scale_cfg, arr_row, arr_col, dataflow=dataflow)
-            cache[key] = group.run(*split_operands(*operands.matrices, job.tile))
+            matrices = group.run(*split_operands(*operands.matrices, job.tile))
+            if charge_psum:
+                row_folds, col_folds = group.get_fold_counts()
+                reads = partial_sum.read_matrix(matrices[2], dataflow,
+                                                row_folds, col_folds)
+                if reads is not None:
+                    matrices = matrices + (reads,)
+            cache[key] = matrices
         return cache[key]
 
     return demand_for
