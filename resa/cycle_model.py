@@ -160,6 +160,92 @@ def partial_sum_reads(dataflow, m, n, k, arr_row, arr_col):
     return (row_folds - 1) * m * n
 
 
+def mapping_efficiency(dataflow, m, n, k, arr_row, arr_col):
+    """Average fraction of the PE grid holding a useful operand, over all folds.
+
+    SCALE-Sim's own metric (single_layer_sim.py:338, "Mapping Efficiency %"),
+    derived here instead of measured so the report can carry it without building
+    a demand matrix. Each fold uses min(arr_row, what is left) rows and likewise
+    columns, so the average factorises into the two axes:
+
+        WS   rows fold over K, cols over N
+        IS   rows fold over K, cols over M
+        OS   rows fold over M, cols over N
+
+    Dense only. Sparsity is out of scope and asserted off in subarray_group, so
+    the WS path's sum_sparse term reduces to the same count.
+    """
+    _check(dataflow, m, n, k, arr_row, arr_col)
+    rows, cols = _fold_axes(dataflow, m, n, k)
+    row_folds, col_folds = fold_counts(dataflow, m, n, k, arr_row, arr_col)
+    mean_rows = ((row_folds - 1) * arr_row + (rows - (row_folds - 1) * arr_row)) / row_folds
+    mean_cols = ((col_folds - 1) * arr_col + (cols - (col_folds - 1) * arr_col)) / col_folds
+    return (mean_rows / arr_row) * (mean_cols / arr_col)
+
+
+def cycles_per_fold(dataflow, m, n, k, arr_row, arr_col):
+    """Cycles SCALE-Sim charges one fold when computing compute utilisation.
+
+    It is shape[0] + shape[1] - 1 of the pre-skew fold demand, which works out
+    to rows_per_fold() for OS and rows_per_fold() + arr_col - 1 for WS and IS.
+    Verified against the per-fold lists the compute classes build.
+    """
+    base = rows_per_fold(dataflow, m, n, k, arr_row, arr_col)
+    return base if dataflow == 'os' else base + arr_col - 1
+
+
+def compute_utilisation(dataflow, m, n, k, arr_row, arr_col):
+    """Average fraction of PE-cycles doing useful work, over all folds.
+
+    SCALE-Sim's "Compute Util %" (single_layer_sim.py:339), which differs from
+    mapping efficiency by also charging the pipeline fill and drain: a fold maps
+    mac_used PEs but occupies cycles_per_fold() cycles to push T operands
+    through them.
+
+        mac_used * T / (arr_row * arr_col * cycles_per_fold)
+
+    T is the dimension streamed through the held one -- M for WS, N for IS, K
+    for OS -- and cycles_per_fold is the same for every fold, so this reduces to
+    T * mapping_efficiency / cycles_per_fold.
+    """
+    _check(dataflow, m, n, k, arr_row, arr_col)
+    streamed = {'ws': m, 'is': n, 'os': k}[dataflow]
+    cycles = cycles_per_fold(dataflow, m, n, k, arr_row, arr_col)
+    return streamed * mapping_efficiency(dataflow, m, n, k, arr_row, arr_col) / cycles
+
+
+def weighted_utilisation(dataflow, shapes, k, arr_row, arr_col):
+    """(mapping efficiency, compute utilisation) over a layer's tile shapes.
+
+    `shapes` is [(m_len, n_len, count)] as tile_search.tile_shapes produces. A
+    layer is generally cut into tiles of two sizes -- full ones and a smaller
+    remainder on each axis -- and the edge tiles map fewer PEs, so the layer
+    figure is the tile figures weighted by how many tiles have that shape.
+
+    Native SCALE-Sim has no equivalent weighting because it runs a layer as a
+    single tile.
+    """
+    total = sum(count for _, _, count in shapes)
+    if not total:
+        return 0.0, 0.0
+    mapping = sum(count * mapping_efficiency(dataflow, m_len, n_len, k,
+                                             arr_row, arr_col)
+                  for m_len, n_len, count in shapes) / total
+    compute = sum(count * compute_utilisation(dataflow, m_len, n_len, k,
+                                              arr_row, arr_col)
+                  for m_len, n_len, count in shapes) / total
+    return mapping, compute
+
+
+def _fold_axes(dataflow, m, n, k):
+    """(what folds onto rows, what folds onto cols) for a dataflow."""
+    if dataflow == 'ws':
+        return k, n
+    if dataflow == 'is':
+        return k, m
+    return m, n
+
+
 def valid_ifmap_rows(ifmap_op_mat):
     """Per-operand-row count of valid (non -1) ifmap entries.
 

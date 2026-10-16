@@ -31,8 +31,8 @@ from resa.fission import fission_space
 from resa.resa_config import resa_config
 from resa.resa_sim import evaluate_layer, layer_operands
 from resa.tensor_split import layer_tiling
-from resa.tile_search import (search_model, write_profiling_table,
-                              write_ranking_table)
+from resa.tile_search import (search_model, tile_shapes,
+                              write_profiling_table, write_ranking_table)
 from scalesim.topology_utils import topologies
 
 WORKLOADS = {
@@ -280,10 +280,11 @@ def cmd_evaluate(args):
 
             best = None
             for row in by_layer[(model, layer_id)]:
-                compute = evaluate_layer(
+                result = evaluate_layer(
                     cfg, operands, space.get(int(row['R']), int(row['S'])),
                     row['dataflow'], int(row['m_tile_size']),
-                    int(row['n_tile_size']), mode='fast').total_cycles
+                    int(row['n_tile_size']), mode='fast')
+                compute = result.total_cycles
                 tiling = layer_tiling(operands.m, operands.n,
                                       m_tile_size=int(row['m_tile_size']),
                                       n_tile_size=int(row['n_tile_size']))
@@ -292,9 +293,19 @@ def cmd_evaluate(args):
                 wait = memory_policy.resa_wait(traffic, bandwidth, compute)
                 total = compute + wait.wait_cycles
                 if best is None or total < best[0]:
-                    best = (total, compute, wait, traffic, row)
+                    best = (total, compute, wait, traffic, row, result, tiling)
 
-            total, compute, wait, traffic, row = best
+            total, compute, wait, traffic, row, result, tiling = best
+            fission_obj = space.get(int(row['R']), int(row['S']))
+            tile_rows, tile_cols = fission_obj.logical_dims
+            mapping_eff, compute_util = cycle_model.weighted_utilisation(
+                row['dataflow'],
+                tile_shapes(tiling.num_operand_rows, tiling.num_filters,
+                            tiling.m_tile_size, tiling.n_tile_size),
+                operands.k, tile_rows, tile_cols)
+            base_mapping, base_util = cycle_model.weighted_utilisation(
+                'ws', [(operands.m, operands.n, 1)], operands.k,
+                *monolithic.logical_dims)
             planaria = memory_policy.planaria_wait(traffic, bandwidth, compute)
             picks['%sx%s' % (row['R'], row['S'])] += 1
 
@@ -304,13 +315,20 @@ def cmd_evaluate(args):
                 m_tile_size=int(row['m_tile_size']),
                 n_tile_size=int(row['n_tile_size']),
                 tiles=traffic.num_tiles, threads=int(row['threads']),
-                compute_cycles=compute, memory_wait_cycles=wait.wait_cycles,
+                compute_cycles=compute,
+                stall_cycles=result.contention.stall_cycles,
+                memory_wait_cycles=wait.wait_cycles,
                 total_cycles=total, dram_words=traffic.total_words,
                 pe_utilisation_pct=100.0 * macs / (total * num_pes),
+                mapping_efficiency_pct=100.0 * mapping_eff,
+                compute_util_pct=100.0 * compute_util,
                 baseline_compute_cycles=base.total_cycles,
+                baseline_stall_cycles=base.contention.stall_cycles,
                 baseline_memory_wait_cycles=base_wait.wait_cycles,
                 baseline_total_cycles=base_total,
                 baseline_pe_utilisation_pct=100.0 * macs / (base_total * num_pes),
+                baseline_mapping_efficiency_pct=100.0 * base_mapping,
+                baseline_compute_util_pct=100.0 * base_util,
                 speedup=base_total / total,
                 planaria_policy_wait_cycles=planaria.wait_cycles,
                 memory_wait_ratio_planaria_over_resa=(
